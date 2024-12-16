@@ -81,6 +81,8 @@ def generate_narrative(data, summary, output_dir):
         return narrative
     except openai.error.OpenAIError as e:
         return f"Error generating narrative: {str(e)}"
+        msg = str(e)  # or any other string message you want to log
+        log(f"{msg} [red]UNEXPECTED FAILURE[/red] {e}", last=True)
 
 # Function to write results to README.md
 def write_readme(narrative, output_dir):
