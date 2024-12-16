@@ -1,126 +1,191 @@
 import os
+from dotenv import load_dotenv
 import pandas as pd
+import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-import openai
-import uvicorn
+import requests
+import json
+from datetime import datetime
+from scipy import stats
+import argparse
 
-# Set up the AI Proxy token
-openai.api_key = os.environ.get("AIPROXY_TOKEN")
+# Load the .env file from the specified directory
+def load_env(file_name):
+    dotenv_path = os.path.join("C:/Users/91735/OneDrive/Desktop/Analysis", file_name)
+    load_dotenv(dotenv_path)
+    return os.environ.get("AIPROXY_TOKEN")
 
-# Function to load the CSV data
-def load_data(file_path):
-    data = pd.read_csv(file_path)
-    return data
-
-# Function to get summary statistics and check for missing data
-def get_summary_statistics(data):
-    summary = {
-        "missing_values": data.isnull().sum(),
-        "summary_statistics": data.describe(),
-        "correlation_matrix": data.corr(),
+# Initialize OpenAI API
+def init_openai_api():
+    api_token = load_env("myfile.env")
+    if not api_token:
+        raise ValueError("Error: AIPROXY_TOKEN not found in .env file.")
+    return {
+        "base_url": "https://aiproxy.sanand.workers.dev/openai/v1",
+        "headers": {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_token}"
+        }
     }
-    return summary
 
-# Function to run basic EDA and clustering analysis
-def basic_analysis(data):
-    scaler = StandardScaler()
-    numeric_columns = data.select_dtypes(include=[np.number]).columns
-    data_scaled = scaler.fit_transform(data[numeric_columns])
-
-    kmeans = KMeans(n_clusters=3)
-    data['Cluster'] = kmeans.fit_predict(data_scaled)
-
-    return data, kmeans
-
-# Function to create charts
-def create_visualizations(data, summary, output_dir):
-    # Correlation heatmap
-    corr_heatmap = sns.heatmap(summary["correlation_matrix"], annot=True, cmap='coolwarm')
-    plt.title('Correlation Matrix')
-    plt.savefig(os.path.join(output_dir, "correlation_heatmap.png"))
-    plt.close()
-
-    # Cluster distribution plot
-    sns.pairplot(data, hue="Cluster", palette='Set1')
-    plt.title('Cluster Distribution')
-    plt.savefig(os.path.join(output_dir, "cluster_distribution.png"))
-    plt.close()
-
-# Function to generate the narrative using OpenAI's GPT
-def generate_narrative(data, summary, output_dir):
-    data_description = data.head().to_dict()
-    summary_stats = summary["summary_statistics"].to_dict()
-    
-    prompt = f"""
-    Given the dataset with the following columns and types: {list(data.columns)},
-    please describe the dataset, provide an analysis, and suggest actionable insights.
-    
-    The summary statistics are as follows: {summary_stats}.
-    The correlation matrix is as follows: {summary["correlation_matrix"]}.
-    Please write a narrative that:
-    - Describes the data.
-    - Summarizes the analysis.
-    - Gives insights on possible patterns and implications for decision making.
-    - Include the following images in your output:
-      1. Correlation heatmap: {os.path.join(output_dir, "correlation_heatmap.png")}
-      2. Cluster distribution: {os.path.join(output_dir, "cluster_distribution.png")}
-    """
-    
+# Read CSV with fallback encoding
+def read_csv(filename):
     try:
-        response = openai.Completion.create(
-            model="gpt-4.0-mini",  # Specify the model version
-            prompt=prompt,
-            max_tokens=1500,
-            temperature=0.7,
+        return pd.read_csv(filename, encoding="utf-8")
+    except UnicodeDecodeError:
+        return pd.read_csv(filename, encoding="latin1")
+    except Exception as e:
+        raise ValueError(f"Error loading {filename}: {e}")
+
+# Perform detailed statistical analysis on the dataset
+def analyze_data(df):
+    numeric_data = df.select_dtypes(include=[np.number])
+    return {
+        "shape": df.shape,
+        "columns": df.columns.tolist(),
+        "missing_values": df.isnull().sum().to_dict(),
+        "summary_statistics": df.describe(include="all").to_dict(),
+        "skewness": numeric_data.skew().to_dict(),
+        "kurtosis": numeric_data.kurt().to_dict(),
+        "correlation_matrix": numeric_data.corr().to_dict() if not numeric_data.empty else {}
+    }
+
+# Identify outliers using the Interquartile Range (IQR) method
+def identify_outliers(df):
+    numeric_data = df.select_dtypes(include=[np.number])
+    q1 = numeric_data.quantile(0.25)
+    q3 = numeric_data.quantile(0.75)
+    iqr = q3 - q1
+    return ((numeric_data < (q1 - 1.5 * iqr)) | (numeric_data > (q3 + 1.5 * iqr))).sum().to_dict()
+
+# Generate visualizations and save as images
+def generate_visualizations(df, analysis, output_prefix):
+    charts = []
+    numeric_columns = df.select_dtypes(include=["number"]).columns
+    if numeric_columns.empty:
+        return charts
+
+    # Correlation Heatmap
+    if analysis.get("correlation_matrix"):
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(df[numeric_columns].corr(), annot=True, cmap="coolwarm", fmt=".2f", linewidths=0.5)
+        heatmap_file = f"{output_prefix}_heatmap.png"
+        plt.title("Correlation Heatmap")
+        plt.savefig(heatmap_file, dpi=100, bbox_inches='tight')
+        charts.append(heatmap_file)
+        plt.close()
+
+    # Histograms
+    for col in numeric_columns:
+        plt.figure(figsize=(8, 6))
+        sns.histplot(df[col], kde=True, bins=30, color="blue")
+        plt.title(f"Distribution of {col}")
+        hist_file = f"{output_prefix}_{col}_hist.png"
+        plt.savefig(hist_file, dpi=100, bbox_inches='tight')
+        charts.append(hist_file)
+        plt.close()
+
+    # Outlier Bar Plot
+    outliers = identify_outliers(df)
+    if outliers and sum(outliers.values()) > 0:
+        plt.figure(figsize=(10, 6))
+        pd.Series(outliers).plot(kind="bar", color="red")
+        plt.title("Outlier Counts by Column")
+        outliers_file = f"{output_prefix}_outliers.png"
+        plt.savefig(outliers_file, dpi=100, bbox_inches='tight')
+        charts.append(outliers_file)
+        plt.close()
+
+    return charts
+
+# Construct a dynamic prompt for the LLM
+def construct_prompt(analysis, charts, filename):
+    chart_descriptions = "\n".join([f"- {chart}" for chart in charts])
+    return f"""
+    I analyzed a dataset from {filename}. Here are the details:
+    - Shape: {analysis['shape']}
+    - Columns: {analysis['columns']}
+    - Missing Values: {analysis['missing_values']}
+    - Summary Statistics: {analysis['summary_statistics']}
+    - Skewness: {analysis['skewness']}
+    - Kurtosis: {analysis['kurtosis']}
+
+    The following charts were generated:
+    {chart_descriptions}
+
+    Write a detailed report summarizing the dataset, the analyses conducted, key insights derived, and actionable recommendations based on these insights.
+    """
+
+# Generate a detailed story from the LLM
+def narrate_story(api, analysis, charts, filename):
+    prompt = construct_prompt(analysis, charts, filename)
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7
+    }
+
+    try:
+        response = requests.post(
+            f"{api['base_url']}/chat/completions", 
+            headers=api['headers'], 
+            json=data
         )
-        narrative = response.choices[0].text.strip()
-        return narrative
-    except openai.error.OpenAIError as e:
-        return f"Error generating narrative: {str(e)}"
-        msg = str(e)  # or any other string message you want to log
-        log(f"{msg} [red]UNEXPECTED FAILURE[/red] {e}", last=True)
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+    except requests.exceptions.RequestException as e:
+        return f"Story generation failed: {e}"
 
-# Function to write results to README.md
-def write_readme(narrative, output_dir):
-    readme_path = os.path.join(output_dir, "README.md")
-    with open(readme_path, 'w') as f:
-        f.write("# Automated Analysis Report\n\n")
-        f.write("### Narrative of the Data Analysis\n")
-        f.write(narrative)
+# Save story and visualizations to a markdown file
+def save_readme(story, charts, output_file):
+    try:
+        with open(output_file, "w") as f:
+            f.write("# Analysis Report\n\n")
+            f.write(story + "\n\n")
+            for chart in charts:
+                f.write(f"![Chart](./{chart})\n")
+        print(f"README saved to {output_file}")
+    except Exception as e:
+        print(f"Error saving README: {e}")
 
-# Main function to run the entire analysis process
-def main(file_path):
-    # Load the dataset
-    data = load_data(file_path)
+# Generate unique filename
+def generate_unique_filename(filename):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename, extension = os.path.splitext(filename)
+    return f"{filename}_{timestamp}{extension}"
 
-    # Get summary statistics and perform basic analysis
-    summary = get_summary_statistics(data)
-    data_with_clusters, _ = basic_analysis(data)
-
-    # Create directory for output files
-    output_dir = os.path.splitext(file_path)[0]
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Create visualizations
-    create_visualizations(data_with_clusters, summary, output_dir)
-
-    # Generate the narrative story
-    narrative = generate_narrative(data_with_clusters, summary, output_dir)
-
-    # Write the narrative and results to README.md
-    write_readme(narrative, output_dir)
-
-    print(f"Analysis completed. Check the output directory: {output_dir}")
-
-# Run the script by calling the main function when executed via the command line
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) != 2:
-        print("Usage: uv run autolysis.py <dataset.csv>")
+# Main script execution
+def main():
+    parser = argparse.ArgumentParser(description="Automated Data Analysis Script")
+    parser.add_argument("input", type=str, help="CSV file or folder containing the CSV files")
+    
+    args = parser.parse_args()
+    
+    # Check if input is a file or folder
+    if os.path.isfile(args.input):
+        csv_files = [os.path.basename(args.input)]
+        os.chdir(os.path.dirname(args.input) or os.getcwd())
+    elif os.path.isdir(args.input):
+        os.chdir(args.input)
+        csv_files = [f for f in os.listdir(args.input) if f.endswith('.csv')]
     else:
-        dataset_file = sys.argv[1]
-        main(dataset_file)
+        print(f"Error: The input '{args.input}' is neither a valid file nor a folder.")
+        return
+    
+    api = init_openai_api()
+
+    for filename in csv_files:
+        filepath = os.path.join(os.getcwd(), filename)
+        df = read_csv(filepath)
+        analysis = analyze_data(df)
+        output_prefix = os.path.splitext(filename)[0]
+        charts = generate_visualizations(df, analysis, output_prefix)
+        story = narrate_story(api, analysis, charts, filename)
+        readme_file = generate_unique_filename(f"README_{output_prefix}.md")
+        save_readme(story, charts, readme_file)
+        print(f"Analysis completed for {filename}. Check {readme_file} and charts.")
+
+if __name__ == "__main__":
+    main()
